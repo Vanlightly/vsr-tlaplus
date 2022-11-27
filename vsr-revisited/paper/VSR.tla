@@ -20,7 +20,8 @@ So far:
     - Basic safety and liveness
         - Safety: No executed ops are lost.
         - Liveness: View changes eventually complete.
-- No recovery
+- Recovery
+    - First draft, being tested
 - No reconfiguration
 - No explicit failures
     - Messages may never be received, so the unavailability is 
@@ -52,7 +53,13 @@ Current questions:
     replicas (including itself), it sets its view-number
     to that in the messages."
    This doesn't match my rules (a)-(e), but I can't see what rules
-   would make this sentence in the paper valid. 
+   would make this sentence in the paper valid.
+2) Recovery doesn't specify what happens if it gets responses
+   from multiple views and primaries. Highest wins I would assume
+   but are there any surprises lurking there? Is it only valid
+   if the f+1 are of the same view, or just highest wins is
+   enough? If the primary is not of the highest view, assume
+   not valid. Try again? 
 
 Defects so far:
 1) State transfer can cause data loss. 3 view changes, 3 replicas and 3 values
@@ -67,9 +74,15 @@ Defects so far:
        v' (last normal view) in a DVC message but a smaller log (because it truncated it).
        So it's truncated log can win, and therefore overwrite committed entries.
 
-A fix has not yet been explored, but these could involve not truncating
-on GetState, but overwriting on receiving NewState. Other, better
-options may exist.
+    A fix has not yet been explored, but some ideas:
+    i)   Not truncating on GetState, but overwriting on receiving NewState.
+    ii)  Allowing a replica to be more strict about when it can initiate a 
+         view change. For example, currently a replica cannot differentiate
+         between lost messages and being ignored because its view number is
+         too low.
+    iii) Replace the pull method (GetState) with a push method where
+         the primary detects that the replica is behind and sends a
+         snapshot.
 
 *)
 
@@ -79,7 +92,8 @@ EXTENDS Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, TLC, TLCEx
 CONSTANTS ReplicaCount,
           ClientCount,
           Values,
-          StartViewOnTimerLimit
+          StartViewOnTimerLimit,
+          RestartEmptyLimit
 
 \* Status          
 CONSTANTS Normal,
@@ -115,18 +129,26 @@ VARIABLES replicas,                 \* set of replicas as integers
           rep_dvc_recv,             \* function of replica -> set of DVC msgs received
           rep_sent_dvc,             \* function of replica -> TRUE/FALSE whether DVC was sent
           rep_sent_sv,              \* function of replica -> TRUE/FALSE whether SV was sent
+          rep_rec_number,
+          rep_rec_recv,
           clients,
           messages,                 \* messages as a function of message -> pending deliveries
           aux_svc,                  \* used to track number of times a timer-based SVC is sent
+          aux_restart,
           aux_client_acked          \* used to track which operations have been acknowledged
 
 rep_state_vars == << rep_status, rep_log, rep_view_number, rep_op_number, rep_peer_op_number,
                      rep_commit_number, rep_client_table, rep_last_normal_view >>
+rep_rec_vars == << rep_rec_number, rep_rec_recv >>
 rep_vc_vars == << rep_svc_recv, rep_dvc_recv, rep_sent_dvc, rep_sent_sv >>
 client_vars    == << >>
-aux_vars       == << aux_svc, aux_client_acked >>             
-vars           == << rep_state_vars, rep_vc_vars, client_vars, aux_vars, 
-                     replicas, clients, messages >> 
+aux_vars       == << aux_svc, aux_restart, aux_client_acked >>             
+vars           == << rep_state_vars, rep_rec_vars, rep_vc_vars, client_vars, aux_vars, 
+                     replicas, clients, messages >>
+                     
+view == <<rep_state_vars, rep_rec_vars, rep_vc_vars, client_vars,  
+                     replicas, clients, messages>>
+symmValues == Permutations(Values)
           
 \*****************************************
 \* Message passing
@@ -181,6 +203,22 @@ StartViewMsgType ==
     [type: StartViewMsg,
      view_number: Nat,
      log: [Nat -> LogEntryType],
+     op_number: Nat,
+     commit_number: Nat,
+     dest: Nat,
+     source: Nat]
+     
+RecoveryMsgType ==
+    [type: RecoveryMsg,
+     x: Nat,
+     dest: Nat,
+     source: Nat]
+    
+RecoveryResponseMsgType ==
+    [type: RecoveryResponseMsg,
+     view_number: Nat,
+     x: Nat,
+     log: [Nat |-> LogEntryType],
      op_number: Nat,
      commit_number: Nat,
      dest: Nat,
@@ -301,9 +339,12 @@ Init ==
         /\ rep_sent_dvc = [r \in replica_ids |-> FALSE]
         /\ rep_sent_sv = [r \in replica_ids |-> FALSE]
         /\ rep_last_normal_view = [r \in replica_ids |-> 0]
+        /\ rep_rec_recv = [r \in replica_ids |-> {}]
+        /\ rep_rec_number = [r \in replica_ids |-> 0]
         /\ clients = client_ids
         /\ messages = <<>>
         /\ aux_svc = 0
+        /\ aux_restart = 0
         /\ aux_client_acked = <<>>
         
 \*****************************************
@@ -350,7 +391,7 @@ ReceiveClientRequest ==
                               source        |-> r], r)
                 /\ aux_client_acked' = aux_client_acked @@ (v :> FALSE)
     /\ UNCHANGED << rep_status, rep_view_number, rep_commit_number, rep_last_normal_view, rep_peer_op_number,
-                    rep_peer_op_number, rep_vc_vars, client_vars, aux_svc, replicas, clients >>
+                    rep_peer_op_number, rep_rec_vars, rep_vc_vars, client_vars, aux_svc, aux_restart, replicas, clients >>
                     
 \*****************************************
 \* ReceivePrepareMsg
@@ -384,7 +425,7 @@ ReceivePrepareMsg ==
                               dest        |-> m.source,
                               source      |-> r])
         /\ UNCHANGED << rep_status, rep_view_number, rep_last_normal_view, rep_peer_op_number, 
-                        rep_vc_vars, client_vars, aux_vars, replicas, clients >>
+                        rep_rec_vars, rep_vc_vars, client_vars, aux_vars, replicas, clients >>
 
 \*****************************************
 \* ReceivePrepareOkMsg
@@ -403,7 +444,7 @@ ReceivePrepareOkMsg ==
         /\ rep_peer_op_number' = [rep_peer_op_number EXCEPT ![r][m.source] = m.op_number]
         /\ Discard(m)
         /\ UNCHANGED << rep_status, rep_view_number, rep_log, rep_op_number, rep_commit_number, rep_client_table, 
-                        rep_last_normal_view, rep_vc_vars, client_vars, aux_vars, replicas, clients >>
+                        rep_last_normal_view, rep_rec_vars, rep_vc_vars, client_vars, aux_vars, replicas, clients >>
 
 
 \*****************************************
@@ -431,7 +472,8 @@ ExecuteOp ==
                 /\ rep_client_table' = [rep_client_table EXCEPT ![r][op.client_id].executed = TRUE]
                 /\ aux_client_acked' = [aux_client_acked EXCEPT ![op.operation] = TRUE]
         /\ UNCHANGED << rep_status, rep_view_number, rep_log, rep_op_number, rep_peer_op_number,
-                        rep_last_normal_view, rep_vc_vars, client_vars, aux_svc, replicas, clients, messages >>
+                        rep_last_normal_view, rep_rec_vars, rep_vc_vars, client_vars, aux_svc, aux_restart,
+                        replicas, clients, messages >>
         
 
 \*****************************************
@@ -471,7 +513,7 @@ SendGetState ==
                              dest        |-> rDest,
                              source      |-> r])
         /\ UNCHANGED << rep_status, rep_peer_op_number, rep_client_table, rep_commit_number,
-                        rep_vc_vars, client_vars, aux_vars, replicas, clients >>
+                        rep_rec_vars, rep_vc_vars, client_vars, aux_vars, replicas, clients >>
 
 \*****************************************
 \* ReceiveGetState
@@ -497,7 +539,7 @@ ReceiveGetState ==
                  commit_number |-> rep_commit_number[r],
                  dest          |-> m.source,
                  source        |-> r])
-        /\ UNCHANGED << rep_state_vars, rep_vc_vars, client_vars, 
+        /\ UNCHANGED << rep_state_vars, rep_rec_vars, rep_vc_vars, client_vars, 
                         aux_vars, replicas, clients >>
 
 \*****************************************
@@ -521,8 +563,8 @@ ReceiveNewState ==
         /\ rep_client_table' = rep_client_table \* TODO
         /\ Discard(m)
         /\ UNCHANGED << rep_status, rep_view_number, rep_peer_op_number,
-                        rep_commit_number, rep_last_normal_view, rep_vc_vars, client_vars, 
-                        aux_vars, replicas, clients >>
+                        rep_commit_number, rep_last_normal_view, rep_rec_vars,
+                        rep_vc_vars, client_vars, aux_vars, replicas, clients >>
                               
 
 \*****************************************
@@ -544,7 +586,8 @@ TimerSendSVC ==
         /\ aux_svc' = aux_svc + 1
         /\ Broadcast(NewSVCMessage(r, View(r) + 1), r)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_client_table, rep_peer_op_number,
-                        rep_last_normal_view, client_vars, replicas, clients, aux_client_acked >>
+                        rep_last_normal_view, rep_rec_vars, client_vars, replicas, clients, 
+                        aux_client_acked, aux_restart >>
                       
 \*****************************************
 \* ReceiveHigherSVC (StartViewChange)
@@ -567,7 +610,7 @@ ReceiveHigherSVC ==
         /\ ResetSentVars(r)
         /\ DiscardAndBroadcast(m, NewSVCMessage(r, m.view_number), r)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_client_table, rep_peer_op_number,
-                        rep_last_normal_view, client_vars, aux_vars, replicas, clients >>
+                        rep_last_normal_view, rep_rec_vars, client_vars, aux_vars, replicas, clients >>
 
 \*****************************************
 \* ReceiveMatchingSVC (StartViewChange)
@@ -587,7 +630,7 @@ ReceiveMatchingSVC ==
         /\ rep_status[r] = ViewChange 
         /\ rep_svc_recv' = [rep_svc_recv EXCEPT ![r] = @ \union {m}]
         /\ Discard(m)
-        /\ UNCHANGED << rep_state_vars, rep_dvc_recv, rep_sent_dvc, rep_sent_sv,
+        /\ UNCHANGED << rep_state_vars, rep_rec_vars, rep_dvc_recv, rep_sent_dvc, rep_sent_sv,
                         client_vars, aux_vars, replicas, clients >>
 
 \*****************************************
@@ -622,7 +665,7 @@ SendDVC ==
               \/ /\ Primary(View(r)) # r
                  /\ Send(msg)
                  /\ UNCHANGED rep_dvc_recv
-        /\ UNCHANGED << rep_state_vars, rep_svc_recv, rep_sent_sv,
+        /\ UNCHANGED << rep_state_vars, rep_rec_vars, rep_svc_recv, rep_sent_sv,
                         client_vars, aux_vars, replicas, clients >>
             
 \*****************************************
@@ -642,7 +685,7 @@ ReceiveHigherDVC ==
         /\ ResetSentVars(r)
         /\ DiscardAndBroadcast(m, NewSVCMessage(r, m.view_number), r)
         /\ UNCHANGED << rep_log, rep_op_number, rep_commit_number, rep_client_table, rep_peer_op_number,
-                        rep_last_normal_view, aux_vars, client_vars, replicas, clients >>
+                        rep_last_normal_view, rep_rec_vars, aux_vars, client_vars, replicas, clients >>
             
 \*****************************************
 \* ReceiveMatchingDVC (DoViewChange)
@@ -656,7 +699,7 @@ ReceiveMatchingDVC ==
         /\ View(r) = m.view_number
         /\ rep_dvc_recv' = [rep_dvc_recv EXCEPT ![r] = @ \union {m}]
         /\ Discard(m)
-        /\ UNCHANGED << rep_state_vars, rep_svc_recv, rep_sent_dvc, rep_sent_sv,
+        /\ UNCHANGED << rep_state_vars, rep_rec_vars, rep_svc_recv, rep_sent_dvc, rep_sent_sv,
                         client_vars, aux_vars, replicas, clients >>
 
 \*****************************************
@@ -714,7 +757,7 @@ SendSV ==
                               dest          |-> Nil,
                               source        |-> r], r)
         /\ UNCHANGED << rep_client_table, rep_svc_recv, rep_dvc_recv, rep_sent_dvc, 
-                        client_vars, aux_vars, replicas, clients >>
+                        rep_rec_vars, client_vars, aux_vars, replicas, clients >>
 
 \*****************************************
 \* ReceiveSV (StartView)
@@ -746,9 +789,109 @@ ReceiveSV ==
                                    dest        |-> Primary(m.view_number),
                                    source      |-> r])
            ELSE Discard(m)
-        /\ UNCHANGED << rep_client_table, rep_peer_op_number,  
+        /\ UNCHANGED << rep_client_table, rep_peer_op_number, rep_rec_vars,
                         client_vars, aux_vars, replicas, clients >>
                   
+       
+\*****************************************
+\* RestartEmpty
+\* 
+
+\* finds the highest unique number ever sent and
+\* adds 1 to it. Avoids the need for a random number.
+UniqueNumber ==
+    IF ~\E m \in DOMAIN messages : m.type = RecoveryMsg
+    THEN 1
+    ELSE LET msg_with_highest_x ==
+                    CHOOSE m \in DOMAIN messages :
+                        /\ m.type = RecoveryMsg
+                        /\ ~\E m1 \in DOMAIN messages :
+                            /\ m1.type = RecoveryMsg
+                            /\ m1.x > m.x
+         IN msg_with_highest_x.x + 1
+
+RestartEmpty ==
+    /\ aux_restart < RestartEmptyLimit
+    /\ \E r \in replicas :
+        /\ rep_log' = [rep_log EXCEPT ![r] = <<>>]
+        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = 1]
+        /\ rep_op_number' = [rep_op_number EXCEPT ![r] = 0]
+        /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = 0]
+        /\ rep_peer_op_number' = [rep_peer_op_number EXCEPT ![r] = 
+                                    [r1 \in replicas |-> 0]]
+        /\ rep_client_table' = [rep_client_table EXCEPT ![r] = 
+                                    [c \in clients |-> EmptyClientTableRow]]
+        /\ rep_svc_recv' = [rep_svc_recv EXCEPT ![r] = {}]
+        /\ rep_dvc_recv' = [rep_dvc_recv EXCEPT ![r] = {}]
+        /\ rep_sent_dvc' = [rep_sent_dvc EXCEPT ![r] = FALSE]
+        /\ rep_sent_sv' = [rep_sent_sv EXCEPT ![r] = FALSE]
+        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = 0]
+        /\ rep_rec_recv' = [rep_rec_recv EXCEPT ![r] = {}]
+        /\ rep_status' = [rep_status EXCEPT ![r] = Recovering]
+        /\ rep_rec_number' = [rep_rec_number EXCEPT ![r] = UniqueNumber]
+        /\ aux_restart' = aux_restart + 1
+        /\ Broadcast([type   |-> RecoveryMsg,
+                      x      |-> UniqueNumber,
+                      dest   |-> Nil,
+                      source |-> r], r)
+        /\ UNCHANGED << client_vars, aux_svc, aux_client_acked, replicas, clients >>
+
+\*****************************************
+\* RestartEmpty
+\*                      
+ReceivesRecoveryMsg ==
+    \E m \in DOMAIN messages, r \in replicas :
+        /\ ReceivableMsg(m, RecoveryMsg, r)
+        /\ rep_status[r] = Normal
+        /\ DiscardAndSend(m, [type          |-> RecoveryResponseMsg,
+                              view_number   |-> View(r),
+                              x             |-> m.x,
+                              log           |-> IF IsPrimary(r) 
+                                                THEN rep_log[r] ELSE Nil,
+                              op_number     |-> IF IsPrimary(r)
+                                                THEN rep_op_number[r] ELSE Nil,
+                              commit_number |-> IF IsPrimary(r)
+                                                THEN rep_commit_number[r] ELSE Nil,
+                              dest          |-> m.source,
+                              source        |-> r])
+        /\ UNCHANGED << rep_state_vars, rep_rec_vars, rep_vc_vars,
+                        client_vars, aux_vars, replicas, clients >>
+
+\*****************************************
+\* ReceivesRecoveryResponseMsg
+\*    
+
+ReceivesRecoveryResponseMsg ==
+    \E m \in DOMAIN messages, r \in replicas :
+        /\ ReceivableMsg(m, RecoveryResponseMsg, r)
+        /\ rep_rec_number[r] = m.x
+        /\ rep_status[r] = Recovering
+        /\ rep_rec_recv' = [rep_rec_recv EXCEPT ![r] = @ \union {m}]
+        /\ Discard(m)
+        /\ UNCHANGED << rep_state_vars, rep_rec_number, rep_vc_vars,
+                        client_vars, aux_vars, replicas, clients >>
+
+\*****************************************
+\* CompleteRecovery
+\*
+
+CompleteRecovery ==
+    \E r \in replicas :
+        /\ rep_status[r] = Recovering
+        /\ Cardinality(rep_rec_recv[r]) > ReplicaCount \div 2
+        /\ \E m \in rep_rec_recv[r] : m.log # Nil
+        /\ LET m == CHOOSE m \in rep_rec_recv[r] : m.log # Nil
+           IN
+                /\ rep_status' = [rep_status EXCEPT ![r] = Normal]
+                /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
+                /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
+                /\ rep_log' = [rep_log EXCEPT ![r] = m.log]
+                /\ rep_op_number' = [rep_op_number EXCEPT ![r] = m.op_number]
+                /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = m.commit_number]
+                /\ rep_rec_recv' = [rep_rec_recv EXCEPT ![r] = {}]
+        /\ UNCHANGED << rep_peer_op_number, rep_client_table,
+                        rep_rec_number, rep_vc_vars, messages,
+                        client_vars, aux_vars, replicas, clients >>
        
 Next ==
     \* view changes
@@ -768,9 +911,11 @@ Next ==
     \/ SendGetState
     \/ ReceiveGetState
     \/ ReceiveNewState
-    \* TODO
     \* recovery
-    \* TODO
+    \/ RestartEmpty
+    \/ ReceivesRecoveryMsg
+    \/ ReceivesRecoveryResponseMsg
+    \/ CompleteRecovery
     \* reconfiguration
     \* TODO
 
