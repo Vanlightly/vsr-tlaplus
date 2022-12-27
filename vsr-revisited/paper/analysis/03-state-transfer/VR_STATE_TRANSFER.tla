@@ -49,7 +49,8 @@ CONSTANTS ReplicaCount,             \* the number of replicas in the cluster
 
 \* Status          
 CONSTANTS Normal,
-          ViewChange
+          ViewChange,
+          StateTransfer
 
 \* Message types          
 CONSTANTS PrepareMsg,
@@ -64,8 +65,8 @@ CONSTANTS Nil,
           AnyDest \* used to signify that a message can be sent to any replica
                   \* can receive a message.
 
-VARIABLES replicas,                 \* set of replicas as integers
-          messages                  \* messages as a function of message -> pending delivery count
+VARIABLES replicas,  \* set of replicas as integers
+          messages   \* messages as a function of message -> pending delivery count
 
 \* Replica state stored as functions of [replica -> state].
 VARIABLES rep_status,               \* replica status (Normal or ViewChange)
@@ -330,9 +331,9 @@ ReceivePrepareMsg ==
     \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ ReceivableMsg(m, PrepareMsg, r)
         /\ rep_status[r] = Normal
         /\ ~IsPrimary(r)
+        /\ ReceivableMsg(m, PrepareMsg, r)
         /\ m.view_number = View(r)
         /\ m.op_number = rep_op_number[r] + 1
         \* mutations to state
@@ -362,9 +363,9 @@ ReceivePrepareOkMsg ==
    \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ ReceivableMsg(m, PrepareOkMsg, r)
         /\ IsPrimary(r)
         /\ rep_status[r] = Normal
+        /\ ReceivableMsg(m, PrepareOkMsg, r)
         /\ m.view_number = View(r)
         /\ m.op_number > rep_peer_op_number[r][m.source]
         \* mutations to state
@@ -409,26 +410,27 @@ ExecuteOp ==
 \*****************************************
 \* SendGetState
 \*
-\* A replica receives a Prepare message from
-\* a higher view than its own and with a gap
-\* between the message operation and the replicas
-\* op number. Therefore it needs to perform
-\* state transfer to get the missing operations
-\* before it can process this Prepare message.
-\* It sets its view to that of the Prepare message,
-\* truncates its log to the commit number
-\* and sends a GetState message to a peer.
+\* A replica receives a Prepare message from a higher 
+\* view than its own and with a gap between the message
+\* operation and the replicas op number. 
+\* Therefore it needs to perform state transfer to get
+\* the missing operations before it can process this Prepare 
+\* message.
+\* The replica sets its view to that of the Prepare message.
+\* In version 2 of the spec, the replica sets its op-number to
+\* its commit-number, truncates its log to the commit-number
+\* and sends a GetState message to a peer. However, this has
+\* been shown to be unsafe.
+\* This is version 3 and the replica does not change its 
+\* op-number or log.
 \* The GetState message is sent to AnyDest which
 \* is a trick to avoid the need for resends (and
 \* thus much longer histories) when a subset of 
 \* other replicas are unavailable. With AnyDest, 
-\* any functioning replica will non-deterministically
-\* receive the message.
-\* SendOnce is used to avoid the need for an extra
-\* variable used to disable the action once the message
-\* is sent.
-\* Note that the commit number can actually be past the
-\* op number on a replica so we take the min of the two.
+\* any functioning replica can non-deterministically
+\* receive the message. SendOnce is used to avoid 
+\* the need for an extra variable used to disable 
+\* the action once the message is sent.
 
 \*TruncateLogToCommitNumber(r, truncate_to) ==
 \*    IF truncate_to = 0
@@ -437,12 +439,15 @@ ExecuteOp ==
 
 SendGetState ==
     \E r \in replicas, m \in DOMAIN messages :
+        \* enabling conditions
         /\ CanProgress(r)
+        /\ rep_status[r] = Normal
         /\ ~IsPrimary(r)
         /\ ReceivableMsg(m, PrepareMsg, r)
-        /\ rep_status[r] = Normal
         /\ m.view_number > View(r)
         /\ m.op_number > rep_op_number[r] + 1
+        \* mutations to state
+        /\ rep_status' = [rep_status EXCEPT ![r] = StateTransfer]
         /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
         /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
         /\ SendOnce([type        |-> GetStateMsg,
@@ -450,7 +455,7 @@ SendGetState ==
                      op_number   |-> rep_commit_number[r],
                      dest        |-> AnyDest,
                      source      |-> r])
-        /\ UNCHANGED << rep_status, rep_log, rep_op_number, rep_peer_op_number, rep_commit_number,
+        /\ UNCHANGED << rep_log, rep_op_number, rep_peer_op_number, rep_commit_number,
                         rep_vc_vars, aux_vars, replicas, no_prog_vars >>
 
 \*****************************************
@@ -463,11 +468,13 @@ SendGetState ==
 \* higher or equal to its own.
 ReceiveGetState ==
     \E r \in replicas, m \in DOMAIN messages :
+        \* enabling conditions
         /\ CanProgress(r)
+        /\ rep_status[r] = Normal
         /\ ReceivableMsg(m, GetStateMsg, r)
         /\ View(r) = m.view_number
-        /\ rep_status[r] = Normal
         /\ rep_op_number[r] > m.op_number
+        \* mutations to state
         /\ DiscardAndSend(m, 
                 [type          |-> NewStateMsg,
                  view_number   |-> View(r),
@@ -488,11 +495,14 @@ ReceiveGetState ==
 \* It appends the log entries to its log.                      
 ReceiveNewState ==
     \E r \in replicas, m \in DOMAIN messages :
+        \* enabling conditions
+        /\ rep_status[r] = StateTransfer
         /\ CanProgress(r)
         /\ ReceivableMsg(m, NewStateMsg, r)
         /\ View(r) = m.view_number
-        /\ rep_status[r] = Normal
         /\ rep_op_number[r] = m.first_op - 1
+        \* mutations to state
+        /\ rep_status' = [rep_status EXCEPT ![r] = Normal]
         /\ rep_log' = [rep_log EXCEPT ![r] = 
                             [on \in 1..m.op_number |->
                                 IF on < m.first_op
@@ -501,7 +511,7 @@ ReceiveNewState ==
         /\ rep_op_number' = [rep_op_number EXCEPT ![r] = m.op_number]
         /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = m.commit_number]
         /\ Discard(m)
-        /\ UNCHANGED << rep_status, rep_view_number, rep_peer_op_number,
+        /\ UNCHANGED << rep_view_number, rep_peer_op_number,
                         rep_last_normal_view,  rep_vc_vars, no_prog_vars, aux_vars, replicas >>
 
 \*****************************************
@@ -922,24 +932,28 @@ OpEventuallyAllOrNothing ==
 
 \* All actions except changes to no_progress
 \* have weak fairness.
-Liveness ==
-    /\ WF_vars(TimerSendSVC)
-    /\ WF_vars(ReceiveHigherSVC)
-    /\ WF_vars(ReceiveMatchingSVC)
-    /\ WF_vars(SendDVC)
-    /\ WF_vars(ReceiveHigherDVC)
-    /\ WF_vars(ReceiveMatchingDVC)
-    /\ WF_vars(SendSV)
-    /\ WF_vars(ReceiveSV)
+
+WFActions ==
+    \/ TimerSendSVC
+    \/ ReceiveHigherSVC
+    \/ ReceiveMatchingSVC
+    \/ SendDVC
+    \/ ReceiveHigherDVC
+    \/ ReceiveMatchingDVC
+    \/ SendSV
+    \/ ReceiveSV
     \* normal operations
-    /\ WF_vars(ReceiveClientRequest)
-    /\ WF_vars(ReceivePrepareMsg)
-    /\ WF_vars(ReceivePrepareOkMsg)
-    /\ WF_vars(ExecuteOp)
+    \/ ReceiveClientRequest
+    \/ ReceivePrepareMsg
+    \/ ReceivePrepareOkMsg
+    \/ ExecuteOp
     \* state transfer
-    /\ WF_vars(SendGetState)
-    /\ WF_vars(ReceiveGetState)
-    /\ WF_vars(ReceiveNewState)
+    \/ SendGetState
+    \/ ReceiveGetState
+    \/ ReceiveNewState
+
+Liveness ==
+    WF_vars(WFActions)
 
 Spec == Init /\ [][Next]_vars
 LivenessSpec == Init /\ [][Next]_vars /\ Liveness
