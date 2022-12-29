@@ -759,7 +759,7 @@ NoLogDivergence ==
             /\ op_number \in DOMAIN rep_log[r2]
             /\ op_number <= rep_commit_number[r1]
             /\ op_number <= rep_commit_number[r2]
-            /\ rep_log[r1][op_number] # rep_log[r1][op_number]
+            /\ rep_log[r1][op_number] # rep_log[r2][op_number]
             
 \* INV: AcknowledgedWritesExistOnMajority
 ReplicaHasOp(r, v) ==
