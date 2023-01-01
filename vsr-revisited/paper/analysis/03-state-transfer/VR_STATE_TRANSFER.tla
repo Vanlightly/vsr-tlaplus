@@ -18,6 +18,7 @@ This specification only includes
 
 and does not include:
 - commit messages (which are a liveness optimization not needed at this point in the analysis)
+- application state
 - client table related stuff
 - replica recovery
 - client recovery
@@ -500,7 +501,6 @@ ReceiveNewState ==
         /\ CanProgress(r)
         /\ ReceivableMsg(m, NewStateMsg, r)
         /\ View(r) = m.view_number
-        /\ rep_op_number[r] = m.first_op - 1
         \* mutations to state
         /\ rep_status' = [rep_status EXCEPT ![r] = Normal]
         /\ rep_log' = [rep_log EXCEPT ![r] = 
@@ -814,8 +814,6 @@ Next ==
 NoLogDivergence ==
     \A op_number \in 1..Cardinality(Values) :
         ~\E r1, r2 \in replicas :
-            /\ op_number \in DOMAIN rep_log[r1]
-            /\ op_number \in DOMAIN rep_log[r2]
             /\ op_number <= rep_commit_number[r1]
             /\ op_number <= rep_commit_number[r2]
             /\ rep_log[r1][op_number] # rep_log[r2][op_number]
@@ -889,10 +887,7 @@ BlockedOnLastViewChange ==
     /\ aux_svc = StartViewOnTimerLimit
     /\ \E r \in replicas :
         /\ no_progress[r] = TRUE
-        /\ \E s \in SUBSET replicas :
-            /\ Cardinality(s) > ReplicaCount \div 2
-            /\ \A r1 \in s : Primary(View(r1)) = r
-    
+        /\ Quantify(replicas, LAMBDA r1 : Primary(View(r1)) = r) > ReplicaCount \div 2
 
 AllReplicasMoveToSameView ==
     \* if we there are no more view changes left and
