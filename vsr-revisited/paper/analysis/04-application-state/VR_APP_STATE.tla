@@ -519,7 +519,6 @@ ReceiveNewState ==
         /\ ReceivableMsg(m, NewStateMsg, r)
         /\ View(r) = m.view_number
         /\ rep_status[r] = StateTransfer
-        /\ rep_op_number[r] = m.first_op - 1
         /\ LET log == [op \in 1..m.op_number |->
                             IF op < m.first_op
                             THEN rep_log[r][op]
