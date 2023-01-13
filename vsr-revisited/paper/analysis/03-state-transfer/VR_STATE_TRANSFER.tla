@@ -102,10 +102,7 @@ symmValues == Permutations(Values)
 \*****************************************
 
 LogEntryType ==
-    [view_number: Nat,
-     operation: Values,
-     client_id: Nat,
-     request_number: Nat]
+    [operation: Values]
      
 PrepareMsgType ==
     [type: PrepareMsg,
@@ -236,8 +233,13 @@ LastNormalView(r) ==
 Primary(v) ==
     1 + ((v-1) % ReplicaCount)
     
-IsPrimary(r) ==
-    Primary(View(r)) = r
+IsNormalPrimary(r) ==
+    /\ Primary(View(r)) = r
+    /\ rep_status[r] = Normal
+    
+IsNormalBackup(r) ==
+    /\ ~Primary(View(r)) = r
+    /\ rep_status[r] = Normal    
 
 NewSVCMessage(r, dest, view_number) ==
     [type        |-> StartViewChangeMsg,
@@ -297,14 +299,11 @@ ReceiveClientRequest ==
     \E r \in replicas, v \in Values :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ IsPrimary(r)
-        /\ rep_status[r] = Normal
+        /\ IsNormalPrimary(r)
         /\ v \notin DOMAIN aux_client_acked
         \* mutations to state
         /\ LET op_number  == Len(rep_log[r]) + 1
-               log_entry  == [view_number    |-> View(r),
-                              operation      |-> v,
-                              client_id      |-> Nil]
+               log_entry  == [operation |-> v]
            IN
                 /\ rep_log' = [rep_log EXCEPT ![r] = Append(@, log_entry)]
                 /\ rep_op_number' = [rep_op_number EXCEPT ![r] = op_number]
@@ -332,8 +331,7 @@ ReceivePrepareMsg ==
     \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ rep_status[r] = Normal
-        /\ ~IsPrimary(r)
+        /\ IsNormalBackup(r)
         /\ ReceivableMsg(m, PrepareMsg, r)
         /\ m.view_number = View(r)
         /\ m.op_number = rep_op_number[r] + 1
@@ -364,8 +362,7 @@ ReceivePrepareOkMsg ==
    \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ IsPrimary(r)
-        /\ rep_status[r] = Normal
+        /\ IsNormalPrimary(r)
         /\ ReceivableMsg(m, PrepareOkMsg, r)
         /\ m.view_number = View(r)
         /\ m.op_number > rep_peer_op_number[r][m.source]
@@ -393,8 +390,7 @@ ExecuteOp ==
    \E r \in replicas :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ IsPrimary(r)
-        /\ rep_status[r] = Normal
+        /\ IsNormalPrimary(r)
         /\ rep_commit_number[r] < rep_op_number[r]
         /\ IsCommitted(r, rep_commit_number[r] + 1)
         \* mutations to state
@@ -442,22 +438,22 @@ SendGetState ==
     \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ rep_status[r] = Normal
-        /\ ~IsPrimary(r)
+        /\ IsNormalBackup(r)
         /\ ReceivableMsg(m, PrepareMsg, r)
         /\ m.view_number > View(r)
         /\ m.op_number > rep_op_number[r] + 1
         \* mutations to state
         /\ rep_status' = [rep_status EXCEPT ![r] = StateTransfer]
-        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
-        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
+\*        /\ rep_log' = [rep_log EXCEPT ![r] = TruncateLogToCommitNumber(r, rep_commit_number[r])]
+\*        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
+\*        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
         /\ SendOnce([type        |-> GetStateMsg,
                      view_number |-> m.view_number,
                      op_number   |-> rep_commit_number[r],
                      dest        |-> AnyDest,
                      source      |-> r])
-        /\ UNCHANGED << rep_log, rep_op_number, rep_peer_op_number, rep_commit_number,
-                        rep_vc_vars, aux_vars, replicas, no_prog_vars >>
+        /\ UNCHANGED << rep_log, rep_view_number, rep_op_number, rep_peer_op_number, rep_commit_number,
+                        rep_last_normal_view, rep_vc_vars, aux_vars, replicas, no_prog_vars >>
 
 \*****************************************
 \* ReceiveGetState
@@ -500,9 +496,10 @@ ReceiveNewState ==
         /\ rep_status[r] = StateTransfer
         /\ CanProgress(r)
         /\ ReceivableMsg(m, NewStateMsg, r)
-        /\ View(r) = m.view_number
         \* mutations to state
         /\ rep_status' = [rep_status EXCEPT ![r] = Normal]
+        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
+        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
         /\ rep_log' = [rep_log EXCEPT ![r] = 
                             [on \in 1..m.op_number |->
                                 IF on < m.first_op
@@ -511,8 +508,7 @@ ReceiveNewState ==
         /\ rep_op_number' = [rep_op_number EXCEPT ![r] = m.op_number]
         /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = m.commit_number]
         /\ Discard(m)
-        /\ UNCHANGED << rep_view_number, rep_peer_op_number,
-                        rep_last_normal_view,  rep_vc_vars, no_prog_vars, aux_vars, replicas >>
+        /\ UNCHANGED << rep_peer_op_number, rep_vc_vars, no_prog_vars, aux_vars, replicas >>
 
 \*****************************************
 \* TimerSendSVC
@@ -532,7 +528,7 @@ TimerSendSVC ==
     /\ aux_svc < StartViewOnTimerLimit
     /\ \E r \in replicas :
         /\ CanProgress(r)
-        /\ ~IsPrimary(r)
+        /\ ~IsNormalPrimary(r)
         \* mutations to state
         /\ rep_view_number' = [rep_view_number EXCEPT ![r] = View(r) + 1]
         /\ rep_status' = [rep_status EXCEPT ![r] = ViewChange]
