@@ -515,9 +515,12 @@ ReceiveGetState ==
 \* normal view and switches back to Normal status.                  
 ReceiveNewState ==
     \E r \in replicas, m \in DOMAIN messages :
+        \* enabling conditions
+        /\ rep_status[r] = StateTransfer
         /\ CanProgress(r)
         /\ ReceivableMsg(m, NewStateMsg, r)
-        /\ rep_status[r] = StateTransfer
+        /\ m.view_number > View(r)
+        \* mutations to state
         /\ LET log == [op \in 1..m.op_number |->
                             IF op < m.first_op
                             THEN rep_log[r][op]

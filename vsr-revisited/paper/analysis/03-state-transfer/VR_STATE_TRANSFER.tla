@@ -491,6 +491,7 @@ ReceiveNewState ==
         /\ rep_status[r] = StateTransfer
         /\ CanProgress(r)
         /\ ReceivableMsg(m, NewStateMsg, r)
+        /\ m.view_number > View(r)
         \* mutations to state
         /\ rep_status' = [rep_status EXCEPT ![r] = Normal]
         /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
