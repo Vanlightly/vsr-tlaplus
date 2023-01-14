@@ -107,8 +107,7 @@ symmValues == Permutations(Values)
 \*****************************************
 
 LogEntryType ==
-    [view_number: Nat,
-     operation: Values]
+    [operation: Values]
      
 PrepareMsgType ==
     [type: PrepareMsg,
@@ -239,8 +238,13 @@ LastNormalView(r) ==
 Primary(v) ==
     1 + ((v-1) % ReplicaCount)
     
-IsPrimary(r) ==
-    Primary(View(r)) = r
+IsNormalPrimary(r) ==
+    /\ Primary(View(r)) = r
+    /\ rep_status[r] = Normal
+    
+IsNormalBackup(r) ==
+    /\ ~Primary(View(r)) = r
+    /\ rep_status[r] = Normal
 
 NewSVCMessage(r, dest, view_number) ==
     [type        |-> StartViewChangeMsg,
@@ -277,7 +281,6 @@ MaybeExecuteOps(r, log, old_commit, new_commit) ==
          /\ rep_commit_number' = [rep_commit_number EXCEPT ![r] = new_commit]
     ELSE UNCHANGED << rep_app_state, rep_commit_number >>
     
-
 \*****************************************
 \* Actions
 \*****************************************
@@ -326,13 +329,11 @@ ReceiveClientRequest ==
     \E r \in replicas, v \in Values :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ IsPrimary(r)
-        /\ rep_status[r] = Normal
+        /\ IsNormalPrimary(r)
         /\ v \notin DOMAIN aux_client_acked
         \* mutations to state
         /\ LET op_number  == Len(rep_log[r]) + 1
-               log_entry  == [view_number    |-> View(r),
-                              operation      |-> v]
+               log_entry  == [operation |-> v]
            IN
                 /\ rep_log' = [rep_log EXCEPT ![r] = Append(@, log_entry)]
                 /\ rep_op_number' = [rep_op_number EXCEPT ![r] = op_number]
@@ -361,8 +362,7 @@ ReceivePrepareMsg ==
         \* enabling conditions
         /\ CanProgress(r)
         /\ ReceivableMsg(m, PrepareMsg, r)
-        /\ rep_status[r] = Normal
-        /\ ~IsPrimary(r)
+        /\ IsNormalBackup(r)
         /\ m.view_number = View(r)
         /\ m.op_number = rep_op_number[r] + 1
         \* mutations to state
@@ -395,8 +395,7 @@ ReceivePrepareOkMsg ==
         \* enabling conditions
         /\ CanProgress(r)
         /\ ReceivableMsg(m, PrepareOkMsg, r)
-        /\ IsPrimary(r)
-        /\ rep_status[r] = Normal
+        /\ IsNormalPrimary(r)
         /\ m.view_number = View(r)
         /\ m.op_number > rep_peer_op_number[r][m.source]
         \* mutations to state
@@ -422,8 +421,7 @@ PrimaryExecuteOp ==
    \E r \in replicas :
         \* enabling conditions
         /\ CanProgress(r)
-        /\ IsPrimary(r)
-        /\ rep_status[r] = Normal
+        /\ IsNormalPrimary(r)
         /\ rep_commit_number[r] < rep_op_number[r]
         /\ IsCommitted(r, rep_commit_number[r] + 1)
         \* mutations to state
@@ -439,44 +437,42 @@ PrimaryExecuteOp ==
 \*****************************************
 \* SendGetState
 \*
-\* A replica receives a Prepare message from
-\* a higher view than its own and with a gap
-\* between the message operation and the replicas
-\* op number. Therefore it needs to perform
-\* state transfer to get the missing operations
-\* before it can process this Prepare message.
-\* It sets its view to that of the Prepare message,
-\* truncates its log to the commit number
-\* and sends a GetState message to a peer.
+\* A replica receives a Prepare message from a higher 
+\* view than its own and with a gap between the message
+\* operation and the replicas op number. 
+\* Therefore it needs to perform state transfer to get
+\* the missing operations before it can process this Prepare 
+\* message.
+\* The replica sends a GetState message with the view-number
+\* of the Prepare message but does not update its
+\* own view yet. It sets its state to StateTransfer to
+\* avoid interleaving of view changes and state transfer
+\* such that a StartView or NewState message could
+\* overwrite data that would lead to data loss.
 \* The GetState message is sent to AnyDest which
 \* is a trick to avoid the need for resends (and
 \* thus much longer histories) when a subset of 
 \* other replicas are unavailable. With AnyDest, 
-\* any functioning replica will non-deterministically
-\* receive the message.
-\* SendOnce is used to avoid the need for an extra
-\* variable used to disable the action once the message
-\* is sent.
-\* Note that the commit number can actually be past the
-\* op number on a replica so we take the min of the two.
+\* any functioning replica can non-deterministically
+\* receive the message. SendOnce is used to avoid 
+\* the need for an extra variable used to disable 
+\* the action once the message is sent.
 
 SendGetState ==
     \E r \in replicas, m \in DOMAIN messages :
         /\ CanProgress(r)
-        /\ ~IsPrimary(r)
+        /\ IsNormalBackup(r)
         /\ ReceivableMsg(m, PrepareMsg, r)
-        /\ rep_status[r] = Normal
         /\ m.view_number > View(r)
         /\ m.op_number > rep_op_number[r] + 1
         /\ rep_status' = [rep_status EXCEPT ![r] = StateTransfer]
-        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
-        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
         /\ SendOnce([type        |-> GetStateMsg,
                      view_number |-> m.view_number,
                      op_number   |-> rep_commit_number[r],
                      dest        |-> AnyDest,
                      source      |-> r])
-        /\ UNCHANGED << rep_log, rep_app_state, rep_op_number, rep_peer_op_number, rep_commit_number,
+        /\ UNCHANGED << rep_log, rep_view_number, rep_app_state, rep_op_number, 
+                        rep_peer_op_number, rep_commit_number, rep_last_normal_view,
                         rep_rec_vars, rep_vc_vars, aux_vars, replicas, no_prog_vars >>
 
 \*****************************************
@@ -486,7 +482,10 @@ SendGetState ==
 \* matching view and sends its log that is higher
 \* than the message op number.
 \* It ignores GetState messages with an op number that is
-\* higher or equal to its own.
+\* higher or equal to its own (this is an optimzation
+\* for the spec, an implementation would need to take into
+\* account the situation where the message op-number is
+\* lower than its own, but a matching one would be ok).
 
 ReceiveGetState ==
     \E r \in replicas, m \in DOMAIN messages :
@@ -510,14 +509,14 @@ ReceiveGetState ==
 \*****************************************
 \* ReceiveNewState
 \*
-\* A replica receives a NewState message with
-\* a matching view while in the normal status.
-\* It appends the log entries to its log.                      
+\* A replica receives a NewState message while in
+\* the StateTransfer state. It overwrites/appends the 
+\* log entries to its log, updates its view and last 
+\* normal view and switches back to Normal status.                  
 ReceiveNewState ==
     \E r \in replicas, m \in DOMAIN messages :
         /\ CanProgress(r)
         /\ ReceivableMsg(m, NewStateMsg, r)
-        /\ View(r) = m.view_number
         /\ rep_status[r] = StateTransfer
         /\ LET log == [op \in 1..m.op_number |->
                             IF op < m.first_op
@@ -525,12 +524,13 @@ ReceiveNewState ==
                             ELSE m.log[op]]
            IN
                 /\ rep_status' = [rep_status EXCEPT ![r] = Normal]
+                /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
+                /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
                 /\ rep_log' = [rep_log EXCEPT ![r] = log]
                 /\ MaybeExecuteOps(r, log, rep_commit_number[r], m.commit_number)
                 /\ rep_op_number' = [rep_op_number EXCEPT ![r] = m.op_number]
                 /\ Discard(m)
-                /\ UNCHANGED << rep_view_number, rep_peer_op_number, rep_last_normal_view, 
-                                rep_rec_vars, rep_vc_vars, no_prog_vars, aux_vars, replicas >>
+                /\ UNCHANGED << rep_peer_op_number, rep_rec_vars, rep_vc_vars, no_prog_vars, aux_vars, replicas >>
 
 \*****************************************
 \* TimerSendSVC
@@ -550,7 +550,7 @@ TimerSendSVC ==
     /\ aux_svc < StartViewOnTimerLimit
     /\ \E r \in replicas :
         /\ CanProgress(r)
-        /\ ~IsPrimary(r)
+        /\ ~IsNormalPrimary(r)
         \* mutations to state
         /\ rep_view_number' = [rep_view_number EXCEPT ![r] = View(r) + 1]
         /\ rep_status' = [rep_status EXCEPT ![r] = ViewChange]
@@ -851,8 +851,8 @@ NoAppStateDivergence ==
         ~\E r1, r2 \in replicas :
             /\ op_number <= rep_commit_number[r1]
             /\ op_number <= rep_commit_number[r2]
-            /\ rep_app_state[r1][op_number] # rep_app_state[r2][op_number]
-            /\ rep_log[r1][op_number] = rep_app_state[r1][op_number]            
+            /\ rep_app_state[r1][op_number] # rep_app_state[r2][op_number] \* app state matches on r1 and r2
+            /\ rep_log[r1][op_number] = rep_app_state[r1][op_number] \* log matches app state on r1           
             
 \* INV: AcknowledgedWritesExistOnMajority
 ReplicaHasOp(r, v) ==
@@ -923,7 +923,8 @@ BlockedOnLastViewChange ==
     /\ aux_svc = StartViewOnTimerLimit
     /\ \E r \in replicas :
         /\ no_progress[r] = TRUE
-        /\ Quantify(replicas, LAMBDA r1 : Primary(View(r1)) = r) > ReplicaCount \div 2
+        /\ Quantify(replicas, LAMBDA r1 : Primary(View(r1)) = r) 
+                > ReplicaCount \div 2
 
 AllReplicasMoveToSameView ==
     \* if we there are no more view changes left and
