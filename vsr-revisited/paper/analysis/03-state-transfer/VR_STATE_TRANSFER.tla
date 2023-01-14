@@ -413,13 +413,12 @@ ExecuteOp ==
 \* Therefore it needs to perform state transfer to get
 \* the missing operations before it can process this Prepare 
 \* message.
-\* The replica sets its view to that of the Prepare message.
-\* In version 2 of the spec, the replica sets its op-number to
-\* its commit-number, truncates its log to the commit-number
-\* and sends a GetState message to a peer. However, this has
-\* been shown to be unsafe.
-\* This is version 3 and the replica does not change its 
-\* op-number or log.
+\* The replica sends a GetState message with the view-number
+\* of the Prepare message but does not update its
+\* own view yet. It sets its state to StateTransfer to
+\* avoid interleaving of view changes and state transfer
+\* such that a StartView or NewState message could
+\* overwrite data that would lead to data loss.
 \* The GetState message is sent to AnyDest which
 \* is a trick to avoid the need for resends (and
 \* thus much longer histories) when a subset of 
@@ -428,11 +427,6 @@ ExecuteOp ==
 \* receive the message. SendOnce is used to avoid 
 \* the need for an extra variable used to disable 
 \* the action once the message is sent.
-
-\*TruncateLogToCommitNumber(r, truncate_to) ==
-\*    IF truncate_to = 0
-\*    THEN <<>>
-\*    ELSE [n \in 1..truncate_to |-> rep_log[r][n]] 
 
 SendGetState ==
     \E r \in replicas, m \in DOMAIN messages :
@@ -444,9 +438,6 @@ SendGetState ==
         /\ m.op_number > rep_op_number[r] + 1
         \* mutations to state
         /\ rep_status' = [rep_status EXCEPT ![r] = StateTransfer]
-\*        /\ rep_log' = [rep_log EXCEPT ![r] = TruncateLogToCommitNumber(r, rep_commit_number[r])]
-\*        /\ rep_view_number' = [rep_view_number EXCEPT ![r] = m.view_number]
-\*        /\ rep_last_normal_view' = [rep_last_normal_view EXCEPT ![r] = m.view_number]
         /\ SendOnce([type        |-> GetStateMsg,
                      view_number |-> m.view_number,
                      op_number   |-> rep_commit_number[r],
@@ -462,7 +453,10 @@ SendGetState ==
 \* matching view and sends its log that is higher
 \* than the message op number.
 \* It ignores GetState messages with an op number that is
-\* higher or equal to its own.
+\* higher or equal to its own (this is an optimzation
+\* for the spec, an implementation would need to take into
+\* account the situation where the message op-number is
+\* lower than its own, but a matching one would be ok).
 ReceiveGetState ==
     \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions
@@ -487,9 +481,10 @@ ReceiveGetState ==
 \*****************************************
 \* ReceiveNewState
 \*
-\* A replica receives a NewState message with
-\* a matching view while in the normal status.
-\* It appends the log entries to its log.                      
+\* A replica receives a NewState message while in
+\* the StateTransfer state. It overwrites/appends the 
+\* log entries to its log, updates its view and last 
+\* normal view and switches back to Normal status.                      
 ReceiveNewState ==
     \E r \in replicas, m \in DOMAIN messages :
         \* enabling conditions

@@ -1,0 +1,29 @@
+# VR prepare message broadcast and State Transfer vs Raft next/matchIndex
+
+In Raft, the leader uses two maps of [member -> index]: nextIndex and matchIndex to know which entry it should send next to each peer, and the highest acknowledged entry it has received from each peer. If for any reason a follower receives an AppendEntries that is too far ahead, it rejects it and the leader decrements its nextIndex for that follower and tries again, and so on until the nextIndex reaches the correct position for the follower. In this way, a leader is able to send the correct entries to followers.
+
+VR Revisited uses Prepare message broadcast and uses State Transfer to handle the case where the primary is too far ahead. 
+
+The paper describes how the primary broadcasts an operation as soon as it has added it to its log. 
+
+“The primary advances op-number, adds the request to the end of the log, and updates the information for this client in the client-table to contain the new request number, s. Then it sends a {PREPARE v, m, n, k} message to the other replicas, where v is the current view-number, m is the message it received from the client, n is the op-number it assigned to the request, and k is the commit-number.
+
+…
+
+The primary waits for f PREPAREOK messages from different backups; at this point it considers the operation (and all earlier ones) to be committed.“
+
+If one replica is far behind, that replica must use State Transfer to get in-sync with the primary. There is no nextIndex mechanism in VR Revisited though I suspect this would be easier to implement in a real system.
+
+This TLA+ specification models this behaviour by performing a broadcast of a Prepare message on receiving any valid client request. It does use a map exactly the same as Raft’s matchIndex, which is called peer-op-number. This allows the primary to know when any given operation can be committed.
+
+The effect of this broadcast Prepare on receipt of a client request is that the commit-number in the Prepare requests should always be less than or equal to the op-number. Therefore the specification makes no provision for cases where the commit-number can be higher than the op-number - though the paper describes this is possible because of the Commit message which I have not implemented as the state space is crazy big as it is and it is only an optimization. I may implement it later on. 
+
+With the sub-protocols of normal operations (without commit), view changes and state transfer, I have not seen a way for the commit-number to be larger than the op-number on any replica. I have added an invariant to catch if this every happens.
+
+```
+CommitNumberNeverHigherThanOpNumber ==
+    for all r in replicas :
+        commit number of r <= op number of r
+```
+
+If VR Revisited used a Raft style nextIndex/matchIndex method of keeping a leader and follower in-sync, it wouldn’t need state transfer and we would have scenarios where the leader’s commit number could be higher than the op-number it puts in a Prepare message.
