@@ -66,11 +66,6 @@ CONSTANTS PrepareMsg,
           RecoveryMsg,
           RecoveryResponseMsg
           
-CONSTANTS Truncate,
-          Match,
-          Lag,
-          NotPrimary          
-                              
 CONSTANTS Nil,
           AnyDest \* used to signify that a message can be sent to any replica
                   \* can receive a message.
@@ -1115,7 +1110,7 @@ BlockedInRecovery ==
         /\ rep_status[r] = Recovering
         \* there is no message from the primary in the highest view
         /\ ~\E m \in rep_rec_recv[r] :
-            /\ m.flag # NotPrimary
+            /\ m.flag # Nil
             /\ ~\E m1 \in rep_rec_recv[r] :
                 m1.view_number > m.view_number
         \* no more recovery messages will be received
